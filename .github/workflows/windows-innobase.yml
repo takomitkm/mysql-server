@@ -79,21 +79,24 @@ jobs:
             'C:\Program Files\OpenSSL',
             'C:\OpenSSL'
           )
+          $found = $null
           foreach ($c in $candidates) {
             if (Test-Path $c) {
-              Write-Host "FOUND $c"
+              Write-Host "candidate: $c"
               Get-ChildItem $c -Directory | Select-Object Name
               if (Test-Path (Join-Path $c 'include\openssl\ssl.h')) {
                 Write-Host "  -> has include\openssl\ssl.h"
-                "OPENSSL_DIR=$c" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+                $found = $c
+                break
               }
             }
           }
-          if (-not $env:OPENSSL_DIR) {
+          if (-not $found) {
             Write-Error 'No usable OpenSSL installation found'
             exit 1
           }
-          Write-Host "OPENSSL_DIR=$env:OPENSSL_DIR"
+          Write-Host "OPENSSL_DIR=$found"
+          "OPENSSL_DIR=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Configure (MySQL, Windows)
         shell: pwsh
