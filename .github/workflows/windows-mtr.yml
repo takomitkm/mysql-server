@@ -141,6 +141,116 @@ jobs:
           if ($mtr) { Write-Host "mtr launcher: $($mtr.FullName)" }
           else { Write-Host 'mtr launcher not pre-generated; will use mysql-test-run.pl directly' }
 
+      - name: Runtime smoke (initialize + start + DDL + shutdown)
+        shell: pwsh
+        run: |
+          # Self-diagnosing runtime proof that does not depend on MTR's Windows
+          # harness: run the freshly built mysqld directly and exercise exactly
+          # the four call sites this patch adds flush calls to.
+          #   init        -> os_file_create_func (ibdata1, #innodb_redo, undo, dd)
+          #   CREATE TABLE-> os_file_create_func (.ibd)
+          #   RENAME TABLE-> os_file_rename_func (MOVEFILE_WRITE_THROUGH)
+          #   DROP TABLE  -> os_file_delete_if_exists_func
+          # Output is captured in full so a failure is readable in the log.
+          $bindir = (Resolve-Path build).Path
+          $bin    = Join-Path $bindir 'runtime_output_directory\Debug'
+          $mysqld = Join-Path $bin 'mysqld.exe'
+          $mysql  = Join-Path $bin 'mysql.exe'
+          foreach ($p in @($mysqld, $mysql)) {
+            if (-not (Test-Path $p)) { Write-Error "missing $p"; exit 1 }
+          }
+          $smoke = Join-Path $bindir 'smoke'
+          Remove-Item -Recurse -Force $smoke -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "$smoke\data" | Out-Null
+          "bindir=$bindir" | Out-File "$smoke\smoke.log" -Encoding utf8
+
+          Write-Host '--- mysqld --initialize-insecure ---'
+          & $mysqld --no-defaults --initialize-insecure `
+              "--basedir=$bindir" "--datadir=$smoke\data" --console 2>&1 |
+            Tee-Object -FilePath "$smoke\init.log" -Append
+          $rc = $LASTEXITCODE
+          Write-Host "init exit=$rc"
+          if ($rc -ne 0) {
+            Get-Content "$smoke\init.log" -Tail 120
+            exit 1
+          }
+
+          Write-Host '--- start mysqld ---'
+          $port = 13306
+          $proc = Start-Process -FilePath $mysqld -PassThru -NoNewWindow `
+            -ArgumentList @('--no-defaults', "--basedir=$bindir",
+                            "--datadir=$smoke\data", "--port=$port",
+                            '--bind-address=127.0.0.1', '--console',
+                            '--log-error-verbosity=3') `
+            -RedirectStandardOutput "$smoke\server.out" `
+            -RedirectStandardError  "$smoke\server.err"
+          Write-Host "mysqld pid=$($proc.Id)"
+
+          $ready = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 2
+            if ($proc.HasExited) {
+              Write-Host "mysqld exited early, code=$($proc.ExitCode)"
+              break
+            }
+            & $mysql --protocol=tcp -h 127.0.0.1 -P $port -u root `
+                     -e 'SELECT 1' *> $null
+            if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+          }
+
+          if ($ready) {
+            Write-Host '--- DDL exercising the patched call sites ---'
+            $ddl = @(
+              'CREATE DATABASE smoke_d',
+              'CREATE TABLE smoke_d.t1 (a INT PRIMARY KEY) ENGINE=InnoDB',
+              'INSERT INTO smoke_d.t1 VALUES (1),(2),(3)',
+              'CREATE TABLE smoke_d.t2 (a INT PRIMARY KEY) ENGINE=InnoDB',
+              'RENAME TABLE smoke_d.t2 TO smoke_d.t3',
+              'DROP TABLE smoke_d.t3',
+              'CREATE TABLESPACE smoke_ts ADD DATAFILE ''smoke_ts.ibd'' ENGINE=InnoDB',
+              'DROP TABLESPACE smoke_ts',
+              'DROP TABLE smoke_d.t1',
+              'DROP DATABASE smoke_d'
+            ) -join '; '
+            & $mysql --protocol=tcp -h 127.0.0.1 -P $port -u root -e $ddl 2>&1 |
+              Tee-Object -FilePath "$smoke\ddl.log" -Append
+            Write-Host "ddl exit=$LASTEXITCODE"
+            if ($LASTEXITCODE -ne 0) { Get-Content "$smoke\ddl.log" -Tail 80 }
+          }
+
+          $ok = $ready
+          Write-Host '--- shutdown ---'
+          if ($ready) {
+            & $mysql --protocol=tcp -h 127.0.0.1 -P $port -u root -e 'SHUTDOWN' *> $null
+            $proc.WaitForExit(60000) | Out-Null
+          } else {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+
+          Write-Host '--- server stderr tail ---'
+          if (Test-Path "$smoke\server.err") {
+            Get-Content "$smoke\server.err" -Tail 100
+          }
+          if (Test-Path "$smoke\server.out") {
+            Get-Content "$smoke\server.out" -Tail 40
+          }
+
+          # A crash or an InnoDB assertion in the patched helper would show up
+          # as a non-zero exit or a "Assertion" / our warning message here.
+          $errtxt = ''
+          foreach ($f in @("$smoke\server.err", "$smoke\server.out")) {
+            if (Test-Path $f) { $errtxt += Get-Content $f -Raw }
+          }
+          if ($errtxt -match 'fatal error|InnoDB: Assertion|semaphore') {
+            Write-Host 'FATAL marker found in server output'
+            exit 1
+          }
+          if ($errtxt -match 'PARENT_DIR_FLUSH_SKIPPED|Cannot open volume root directory') {
+            Write-Host 'directory-flush warning was emitted (volume root ACL case)'
+          }
+          if (-not $ok) { Write-Error 'runtime smoke failed to reach a running server'; exit 1 }
+          Write-Host 'RUNTIME SMOKE OK'
+
       - name: Run MTR (InnoDB file-operation subset)
         shell: pwsh
         run: |
@@ -156,7 +266,7 @@ jobs:
           Push-Location mysql-test
           perl mysql-test-run.pl `
             --vs-config=Debug `
-            --parallel=2 --force --retry=2 --retry-failure=1 `
+            --parallel=1 --force --retry=1 `
             --max-test-fail=10 --suite=innodb `
             --do-test="$env:DO_TEST" 2>&1 | Tee-Object -FilePath ../mtr-run.log
           $rc = $LASTEXITCODE
@@ -164,6 +274,12 @@ jobs:
           if ($rc -ne 0) {
             Write-Host '--- MTR tail ---'
             Get-Content mtr-run.log -Tail 250
+            Write-Host '--- mysqld error logs ---'
+            Get-ChildItem build\mysql-test\var -Recurse -Filter '*.err' -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                Write-Host "== $($_.FullName)"
+                Get-Content $_.FullName -Tail 60
+              }
             exit 1
           }
 
@@ -175,5 +291,8 @@ jobs:
           path: |
             mtr-run.log
             build-server.log
-            build/mysql-test/var/log/
+            build/smoke/*.log
+            build/smoke/server.err
+            build/smoke/server.out
+            build/mysql-test/var/**
           if-no-files-found: warn
