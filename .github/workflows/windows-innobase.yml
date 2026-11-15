@@ -1,0 +1,113 @@
+# Copyright (c) 2026, Oracle and/or its affiliates.
+#
+# Windows compile check for the InnoDB directory-flush change.
+#
+# Upstream CI (mysql/mysql-server) has no Windows job at all, so the
+# `#else /* _WIN32 */` half of os0file.cc is never compiled by PR CI.
+# This workflow configures MySQL on windows-latest and builds only the
+# `innobase` plugin target, which is the translation unit set that contains
+# os0file.cc. It exists to prove the Windows branch compiles; it is not a
+# substitute for upstream's own Windows packaging build.
+#
+# Lives on the contributor fork only; it is NOT part of the upstream PR.
+
+name: Windows compile check (InnoDB)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch to compile (contains the InnoDB patch)'
+        required: false
+        default: 'ci/windows-innobase'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  innobase-msvc:
+    name: Build innobase (MSVC x64)
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out the branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'ci/windows-innobase' }}
+          persist-credentials: false
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          cmake --version
+          Get-Command cl -ErrorAction SilentlyContinue | Out-Null
+          Write-Host "vcpkg: $(Test-Path 'C:\vcpkg')"
+
+      # Boost is vendored in extra/boost, ICU/protobuf/zlib/lz4 are vendored
+      # under extra/, so OpenSSL is the only external dependency. The runner
+      # image ships one at C:\Program Files\OpenSSL.
+      - name: Locate OpenSSL
+        shell: pwsh
+        run: |
+          $candidates = @(
+            'C:\Program Files\OpenSSL',
+            'C:\Program Files\OpenSSL-Win64',
+            'C:\OpenSSL'
+          )
+          foreach ($c in $candidates) {
+            if (Test-Path $c) { Write-Host "FOUND $c"; Get-ChildItem $c | Select-Object -First 5 }
+          }
+          Get-ChildItem 'C:\Program Files' -Filter '*SSL*' -Directory -ErrorAction SilentlyContinue |
+            Select-Object FullName
+
+      - name: Configure (MySQL, Windows)
+        shell: pwsh
+        run: |
+          $ssl = 'C:\Program Files\OpenSSL-Win64'
+          if (-not (Test-Path $ssl)) { $ssl = 'C:\Program Files\OpenSSL' }
+          Write-Host "Using WITH_SSL=$ssl"
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DWITH_SSL="$ssl" `
+            -DWITH_UNIT_TESTS=OFF `
+            -DWITH_ROUTER=OFF `
+            -DWITH_NDB=OFF `
+            -DWITH_NDBCLUSTER=OFF `
+            -DWITH_MECAB=OFF `
+            -DWITH_LZ4=system `
+            -DWITH_ZLIB=system `
+            -DWITH_EDITLINE=bundled `
+            -DWITH_ICU=bundled `
+            -DWITH_PROTOBUF=bundled `
+            -DMYSQL_MAINTAINER_MODE=OFF
+        # If configuration fails on an unrelated optional component, the log
+        # above tells us which -D to add; the InnoDB sources themselves only
+        # need the generated headers + vendored Boost.
+
+      - name: Build innobase target
+        shell: pwsh
+        run: |
+          cmake --build build --config Debug --target innobase --parallel 4 2>&1 |
+            Tee-Object -FilePath build-innobase.log
+          if ($LASTEXITCODE -ne 0) { Get-Content build-innobase.log -Tail 200; exit 1 }
+
+      - name: Confirm os0file.cc was compiled (not skipped)
+        shell: pwsh
+        run: |
+          $obj = Get-ChildItem -Path build -Recurse -Filter 'os0file*.obj' -ErrorAction SilentlyContinue
+          if (-not $obj) {
+            Write-Error 'os0file.cc did not produce an object file - the Windows branch was NOT compiled'
+            exit 1
+          }
+          $obj | Select-Object FullName, Length, LastWriteTime
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: innobase-windows-build-log
+          path: |
+            build-innobase.log
+            build/CMakeCache.txt
+          if-no-files-found: warn
