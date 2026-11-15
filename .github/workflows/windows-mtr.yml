@@ -1,0 +1,173 @@
+# Windows MTR regression check for the InnoDB directory-flush change.
+#
+# The companion workflow (windows-innobase.yml) proves the _WIN32 half of
+# os0file.cc compiles. This one goes further: builds the full server (mysqld)
+# with MSVC and runs a focused MTR subset covering the code paths the patch
+# touches -- file creation (os_file_create_func), directory creation,
+# deletion (os_file_delete_if_exists_func) and rename.
+#
+# HONEST SCOPE: MTR runs a live mysqld; it cannot simulate a power loss, so it
+# cannot prove directory entries reach stable storage. It proves the patch did
+# not break normal Windows create/drop/rename behaviour. It is not a durability
+# test and not a substitute for Oracle's own Windows packaging/CI.
+#
+# Lives on the contributor fork only; it is NOT part of the upstream PR.
+
+name: Windows MTR (InnoDB file ops)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch to test (contains the InnoDB patch)'
+        required: false
+        default: 'ci/windows-innobase'
+        type: string
+      do_test:
+        description: 'MTR --do-test regex (file-operation tests)'
+        required: false
+        default: '^(create_tablespace|create_table|rename_table|alter_rename_files)$'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  mtr-innodb-win:
+    name: MTR innodb file ops (MSVC x64, Debug)
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out the branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'ci/windows-innobase' }}
+          persist-credentials: false
+
+      - name: Show toolchain
+        shell: pwsh
+        run: cmake --version
+
+      - name: Pick the newest Visual Studio generator
+        shell: pwsh
+        run: |
+          $gens = (cmake --help) -split "`n" | ForEach-Object {
+            if ($_ -match '(Visual Studio (\d+) \d{4})') {
+              [pscustomobject]@{ Name = $Matches[1]; Ver = [int]$Matches[2] }
+            }
+          } | Sort-Object Ver -Unique
+          if (-not $gens) { Write-Error 'No Visual Studio generator'; exit 1 }
+          $gen = ($gens | Select-Object -Last 1).Name
+          Write-Host "Picked generator: $gen"
+          "VS_GEN=$gen" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install bison (required by router/src/routing_guidelines)
+        shell: pwsh
+        run: |
+          choco install winflexbison3 --no-progress -y
+          $found = (Get-Command win_bison -ErrorAction SilentlyContinue).Source
+          if (-not $found) {
+            $candidate = 'C:\ProgramData\chocolatey\bin\win_bison.exe'
+            if (Test-Path $candidate) { $found = $candidate }
+          }
+          if (-not $found) { Write-Error 'win_bison not found'; exit 1 }
+          "BISON_EXECUTABLE=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Locate OpenSSL
+        shell: pwsh
+        run: |
+          $found = $null
+          foreach ($c in @('C:\Program Files\OpenSSL-Win64',
+                           'C:\Program Files\OpenSSL', 'C:\OpenSSL')) {
+            if (Test-Path $c) {
+              if (Test-Path (Join-Path $c 'include\openssl\ssl.h')) {
+                $found = $c; break
+              }
+            }
+          }
+          if (-not $found) { Write-Error 'No usable OpenSSL'; exit 1 }
+          Write-Host "OPENSSL_DIR=$found"
+          "OPENSSL_DIR=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Configure (Debug, with unit tests for MTR debug-sync tests)
+        shell: pwsh
+        run: |
+          Write-Host "Generator=$env:VS_GEN  SSL=$env:OPENSSL_DIR"
+          cmake -S . -B build -G "$env:VS_GEN" -A x64 `
+            -DCMAKE_BUILD_TYPE=Debug `
+            -DWITH_SSL="$env:OPENSSL_DIR" `
+            -DBISON_EXECUTABLE="$env:BISON_EXECUTABLE" `
+            -DWITH_UNIT_TESTS=ON `
+            -DWITH_ROUTER=OFF `
+            -DWITH_NDB=OFF `
+            -DWITH_NDBCLUSTER=OFF `
+            -DWITH_MECAB=OFF `
+            -DWITH_EDITLINE=bundled `
+            -DWITH_ICU=bundled `
+            -DWITH_PROTOBUF=bundled `
+            -DMYSQL_MAINTAINER_MODE=OFF
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Build full server (mysqld + client + mysql-test targets)
+        shell: pwsh
+        run: |
+          cmake --build build --config Debug --parallel 4 2>&1 |
+            Tee-Object -FilePath build-server.log
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content build-server.log -Tail 200
+            exit 1
+          }
+
+      - name: Confirm mysqld binary exists
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path build -Recurse -Filter 'mysqld.exe' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $exe) {
+            Write-Error 'mysqld.exe not found - cannot run MTR'
+            exit 1
+          }
+          Write-Host "mysqld: $($exe.FullName) ($($exe.Length) bytes)"
+
+      - name: Locate Perl and MTR launcher
+        shell: pwsh
+        run: |
+          $perl = (Get-Command perl -ErrorAction SilentlyContinue).Source
+          if (-not $perl) { Write-Error 'perl not found'; exit 1 }
+          Write-Host "perl: $perl"
+          $mtr = Get-ChildItem -Path build -Recurse -Filter 'mtr' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'mysql-test' } | Select-Object -First 1
+          if ($mtr) { Write-Host "mtr launcher: $($mtr.FullName)" }
+          else { Write-Host 'mtr launcher not pre-generated; will use mysql-test-run.pl directly' }
+
+      - name: Run MTR (InnoDB file-operation subset)
+        shell: pwsh
+        run: |
+          # mtr.out-of-source sets MTR_BINDIR and chdirs to the source mysql-test.
+          # The source checkout path has no spaces (D:\a\mysql-server\mysql-server).
+          $env:DO_TEST = '${{ inputs.do_test || '' }}'
+          Write-Host "DO_TEST=$env:DO_TEST"
+          Push-Location mysql-test
+          perl mysql-test-run.pl `
+            --parallel=2 --force --retry=2 --retry-failure=1 `
+            --max-test-fail=10 --suite=innodb `
+            --do-test="$env:DO_TEST" 2>&1 | Tee-Object -FilePath ../mtr-run.log
+          $rc = $LASTEXITCODE
+          Pop-Location
+          if ($rc -ne 0) {
+            Write-Host '--- MTR tail ---'
+            Get-Content mtr-run.log -Tail 250
+            exit 1
+          }
+
+      - name: Upload MTR + build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-mtr-innodb-logs
+          path: |
+            mtr-run.log
+            build-server.log
+            build/mysql-test/var/log/
+          if-no-files-found: warn
