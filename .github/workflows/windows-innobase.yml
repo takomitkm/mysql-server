@@ -71,6 +71,22 @@ jobs:
 
       # Boost is vendored in extra/boost, ICU/protobuf/zlib/lz4 are vendored
       # under extra/, so OpenSSL is the only external dependency.
+      - name: Install bison (required by router/src/routing_guidelines)
+        shell: pwsh
+        run: |
+          choco install winflexbison3 --no-progress -y
+          $found = (Get-Command win_bison -ErrorAction SilentlyContinue).Source
+          if (-not $found) {
+            $candidate = 'C:\ProgramData\chocolatey\bin\win_bison.exe'
+            if (Test-Path $candidate) { $found = $candidate }
+          }
+          if (-not $found) {
+            Write-Error 'win_bison not found after chocolatey install'
+            exit 1
+          }
+          Write-Host "BISON=$found"
+          "BISON_EXECUTABLE=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Locate OpenSSL
         shell: pwsh
         run: |
@@ -104,6 +120,7 @@ jobs:
           Write-Host "Generator=$env:VS_GEN  SSL=$env:OPENSSL_DIR"
           cmake -S . -B build -G "$env:VS_GEN" -A x64 `
             -DWITH_SSL="$env:OPENSSL_DIR" `
+            -DBISON_EXECUTABLE="$env:BISON_EXECUTABLE" `
             -DWITH_UNIT_TESTS=OFF `
             -DWITH_ROUTER=OFF `
             -DWITH_NDB=OFF `
