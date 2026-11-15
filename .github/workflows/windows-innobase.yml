@@ -1,5 +1,3 @@
-# Copyright (c) 2026, Oracle and/or its affiliates.
-#
 # Windows compile check for the InnoDB directory-flush change.
 #
 # Upstream CI (mysql/mysql-server) has no Windows job at all, so the
@@ -15,8 +13,12 @@ name: Windows compile check (InnoDB)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [fix/windows-dirflush]
+    inputs:
+      ref:
+        description: 'Branch to compile (contains the InnoDB patch)'
+        required: false
+        default: 'ci/windows-innobase'
+        type: string
 
 permissions:
   contents: read
@@ -31,61 +33,99 @@ jobs:
       - name: Check out the branch
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref || 'ci/windows-innobase' }}
           persist-credentials: false
 
-      - name: Show toolchain
+      - name: Show toolchain and Visual Studio installations
         shell: pwsh
         run: |
           cmake --version
-          Get-Command cl -ErrorAction SilentlyContinue | Out-Null
-          Write-Host "vcpkg: $(Test-Path 'C:\vcpkg')"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            Write-Host '--- vswhere ---'
+            & $vswhere -products * -prerelease -property installationPath
+            & $vswhere -products * -prerelease -property installationVersion
+          } else {
+            Write-Host 'vswhere not found'
+          }
+          Write-Host '--- CMake Visual Studio generators ---'
+          (cmake --help) -split "`n" |
+            Where-Object { $_ -match 'Visual Studio \d+ \d{4}' } |
+            ForEach-Object { $_.Trim() }
+
+      - name: Pick the newest Visual Studio generator
+        shell: pwsh
+        run: |
+          $gens = (cmake --help) -split "`n" | ForEach-Object {
+            if ($_ -match '(Visual Studio (\d+) \d{4})') {
+              [pscustomobject]@{ Name = $Matches[1]; Ver = [int]$Matches[2] }
+            }
+          } | Sort-Object Ver -Unique
+          if (-not $gens) {
+            Write-Error 'No Visual Studio generator available in this CMake'
+            exit 1
+          }
+          $gen = ($gens | Select-Object -Last 1).Name
+          Write-Host "Picked generator: $gen"
+          "VS_GEN=$gen" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # Boost is vendored in extra/boost, ICU/protobuf/zlib/lz4 are vendored
-      # under extra/, so OpenSSL is the only external dependency. The runner
-      # image ships one at C:\Program Files\OpenSSL.
+      # under extra/, so OpenSSL is the only external dependency.
       - name: Locate OpenSSL
         shell: pwsh
         run: |
           $candidates = @(
-            'C:\Program Files\OpenSSL',
             'C:\Program Files\OpenSSL-Win64',
+            'C:\Program Files\OpenSSL',
             'C:\OpenSSL'
           )
           foreach ($c in $candidates) {
-            if (Test-Path $c) { Write-Host "FOUND $c"; Get-ChildItem $c | Select-Object -First 5 }
+            if (Test-Path $c) {
+              Write-Host "FOUND $c"
+              Get-ChildItem $c -Directory | Select-Object Name
+              if (Test-Path (Join-Path $c 'include\openssl\ssl.h')) {
+                Write-Host "  -> has include\openssl\ssl.h"
+                "OPENSSL_DIR=$c" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              }
+            }
           }
-          Get-ChildItem 'C:\Program Files' -Filter '*SSL*' -Directory -ErrorAction SilentlyContinue |
-            Select-Object FullName
+          if (-not $env:OPENSSL_DIR) {
+            Write-Error 'No usable OpenSSL installation found'
+            exit 1
+          }
+          Write-Host "OPENSSL_DIR=$env:OPENSSL_DIR"
 
       - name: Configure (MySQL, Windows)
         shell: pwsh
         run: |
-          $ssl = 'C:\Program Files\OpenSSL-Win64'
-          if (-not (Test-Path $ssl)) { $ssl = 'C:\Program Files\OpenSSL' }
-          Write-Host "Using WITH_SSL=$ssl"
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
-            -DWITH_SSL="$ssl" `
+          Write-Host "Generator=$env:VS_GEN  SSL=$env:OPENSSL_DIR"
+          cmake -S . -B build -G "$env:VS_GEN" -A x64 `
+            -DWITH_SSL="$env:OPENSSL_DIR" `
             -DWITH_UNIT_TESTS=OFF `
             -DWITH_ROUTER=OFF `
             -DWITH_NDB=OFF `
             -DWITH_NDBCLUSTER=OFF `
             -DWITH_MECAB=OFF `
-            -DWITH_LZ4=system `
-            -DWITH_ZLIB=system `
             -DWITH_EDITLINE=bundled `
             -DWITH_ICU=bundled `
             -DWITH_PROTOBUF=bundled `
             -DMYSQL_MAINTAINER_MODE=OFF
-        # If configuration fails on an unrelated optional component, the log
-        # above tells us which -D to add; the InnoDB sources themselves only
-        # need the generated headers + vendored Boost.
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '--- CMakeError.log ---'
+            Get-ChildItem build -Recurse -Filter 'CMakeError.log' -ErrorAction SilentlyContinue |
+              ForEach-Object { Get-Content $_.FullName -Tail 120 }
+            exit 1
+          }
 
       - name: Build innobase target
         shell: pwsh
         run: |
           cmake --build build --config Debug --target innobase --parallel 4 2>&1 |
             Tee-Object -FilePath build-innobase.log
-          if ($LASTEXITCODE -ne 0) { Get-Content build-innobase.log -Tail 200; exit 1 }
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content build-innobase.log -Tail 200
+            exit 1
+          }
 
       - name: Confirm os0file.cc was compiled (not skipped)
         shell: pwsh
