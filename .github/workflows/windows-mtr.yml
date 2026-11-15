@@ -144,12 +144,18 @@ jobs:
       - name: Run MTR (InnoDB file-operation subset)
         shell: pwsh
         run: |
-          # mtr.out-of-source sets MTR_BINDIR and chdirs to the source mysql-test.
-          # The source checkout path has no spaces (D:\a\mysql-server\mysql-server).
+          # Out-of-source build: MTR_BINDIR must point at the build tree, else
+          # MTR looks for runtime_output_directory/ under the source dir and
+          # bails with "Could not find any of ... runtime_output_directory".
+          # Multi-config VS generator puts the binaries under <build>/
+          # runtime_output_directory/<Config>/, so --vs-config pins it.
+          $env:MTR_BINDIR = (Resolve-Path build).Path
           $env:DO_TEST = '${{ inputs.do_test || '' }}'
+          Write-Host "MTR_BINDIR=$env:MTR_BINDIR"
           Write-Host "DO_TEST=$env:DO_TEST"
           Push-Location mysql-test
           perl mysql-test-run.pl `
+            --vs-config=Debug `
             --parallel=2 --force --retry=2 --retry-failure=1 `
             --max-test-fail=10 --suite=innodb `
             --do-test="$env:DO_TEST" 2>&1 | Tee-Object -FilePath ../mtr-run.log
