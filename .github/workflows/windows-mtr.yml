@@ -261,11 +261,18 @@ jobs:
           # runtime_output_directory/<Config>/, so --vs-config pins it.
           $env:MTR_BINDIR = (Resolve-Path build).Path
           $env:DO_TEST = '${{ inputs.do_test || '' }}'
+          # MTR on Windows mis-joins basedir with a relative vardir
+          # ("...mysql-server" + "build/mysql-test/var" -> "...mysql-serverbuild/..."),
+          # which breaks the tmp/pid paths it hands to mysqld. Pass an absolute,
+          # backslash-only vardir so that relative-path code is not used.
+          $env:MTR_VARDIR = Join-Path (Resolve-Path build).Path 'mysql-test\var'
           Write-Host "MTR_BINDIR=$env:MTR_BINDIR"
+          Write-Host "MTR_VARDIR=$env:MTR_VARDIR"
           Write-Host "DO_TEST=$env:DO_TEST"
           Push-Location mysql-test
           perl mysql-test-run.pl `
             --vs-config=Debug `
+            --vardir="$env:MTR_VARDIR" `
             --parallel=1 --force --retry=1 `
             --max-test-fail=10 --suite=innodb `
             --do-test="$env:DO_TEST" 2>&1 | Tee-Object -FilePath ../mtr-run.log
