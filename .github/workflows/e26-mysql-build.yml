@@ -1,0 +1,116 @@
+name: e26-mysql-build
+
+# E26f: real MySQL server, three variants, DDL-flush cost.
+#   base    = mysql/mysql-server trunk 06bcb0eb (no dir flush on Windows)
+#   dironly = takomitkm/mysql-server 0c860398 (PR #895 commits 1-2: parent-dir flush)
+#   dirroot = takomitkm/mysql-server 9eb979ae (PR #895 head: + volume-root flush)
+#
+# Public-repo Actions has no minute quota and a 6 h per-job ceiling, so a
+# ~2-3 h Windows server build per variant is affordable.  The bench drives
+# the exact call sites os_parent_dir_fsync_win() guards: 200 rounds of
+# CREATE TABLE (opens a new .ibd -> dir flush) + 50 INSERTs + DROP TABLE
+# (deletes the .ibd -> dir flush) on InnoDB, file-per-table on, then times
+# the whole SQL file through the real server.
+
+on:
+  push:
+    branches: [bench-e26]
+  workflow_dispatch:
+
+jobs:
+  build-bench:
+    runs-on: windows-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: base
+            repo: mysql/mysql-server
+            ref: 06bcb0eb0ad281e08dd2b4d81b99ad25491433e7
+          - name: dironly
+            repo: takomitkm/mysql-server
+            ref: 0c860398a8e26526597d3466d27981d19e6b1fae
+          - name: dirroot
+            repo: takomitkm/mysql-server
+            ref: 9eb979ae49a94df805e759931c2667061134291a
+    steps:
+      - name: checkout ${{ matrix.variant.name }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.variant.repo }}
+          ref: ${{ matrix.variant.ref }}
+
+      - name: bison (MySQL git sources generate sql_yacc with it)
+        shell: pwsh
+        run: |
+          $have = Get-Command bison.exe -ErrorAction SilentlyContinue
+          if (-not $have) {
+            choco install -y winflexbison3 2>&1 | Select-Object -Last 3
+          }
+          $b = Get-ChildItem 'C:\ProgramData\chocolatey\bin','C:\Program Files\WinFlexBison' -Filter '*bison*.exe' -Recurse -ErrorAction SilentlyContinue |
+                 Select-Object -First 1 -ExpandProperty FullName
+          if (-not $b) { Write-Host 'no bison found'; exit 1 }
+          Write-Host "bison: $b"
+          Copy-Item $b "D:\bison.exe" -Force
+          "D:\" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A x64 `
+            -DWITH_UNIT_TESTS=0 `
+            -DWITH_SSL=schannel `
+            -DDOWNLOAD_BOOST=1 -DWITH_BOOST="D:\boost" `
+            -DINSTALL_LAYOUT=STANDALONE `
+            -DBISON_EXECUTABLE="D:\bison.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: build mysqld + clients
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target mysqld mysql mysqlslap -- /m
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem build\runtime_output_directory\Release\*.exe |
+            Select-Object Name, Length | Format-Table | Out-String | Write-Host
+
+      - name: initialize + start the server
+        shell: pwsh
+        run: |
+          $bin = 'build\runtime_output_directory\Release'
+          & "$bin\mysqld.exe" --no-defaults --initialize-insecure `
+            --datadir=D:\e26my\data --tmpdir=D:\e26my\tmp 2>&1 | Select-Object -Last 5
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $p = Start-Process "$bin\mysqld.exe" -PassThru -ArgumentList @(
+            '--no-defaults','--datadir=D:\e26my\data','--tmpdir=D:\e26my\tmp',
+            '--port=13306','--bind-address=127.0.0.1','--console')
+          Start-Sleep -Seconds 10
+          & "$bin\mysql.exe" -h127.0.0.1 -P13306 -uroot -e "CREATE DATABASE e26"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "E26MYBIN=$bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: bench - 200 rounds of create/insert/drop on InnoDB
+        shell: pwsh
+        run: |
+          $sql = 'D:\e26.sql'
+          $w = [IO.StreamWriter]::new($sql)
+          foreach ($i in 1..200) {
+            $w.WriteLine("CREATE TABLE e26.t_$i (id INT PRIMARY KEY AUTO_INCREMENT, v CHAR(200)) ENGINE=InnoDB;")
+            foreach ($r in 1..50) {
+              $w.WriteLine("INSERT INTO e26.t_$i (v) VALUES ('{0}');" -f ('x' * 180))
+            }
+            $w.WriteLine("DROP TABLE e26.t_$i;")
+          }
+          $w.Close()
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          & "$env:E26MYBIN\mysql.exe" -h127.0.0.1 -P13306 -uroot < $sql 2>&1 | Write-Host
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $sw.Stop()
+          Write-Host ("{0}: {1:N1} s for 200 create/insert/drop rounds on InnoDB" -f '${{ matrix.variant.name }}', $sw.Elapsed.TotalSeconds)
+          Add-Content $env:GITHUB_STEP_SUMMARY ("| ${{ matrix.variant.name }} | {0:N1} s |" -f $sw.Elapsed.TotalSeconds)
+
+      - name: stop the server
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process mysqld -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue

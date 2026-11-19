@@ -1,0 +1,31 @@
+name: e26-mysql-sim
+
+# E26f: MySQL-shaped flush sim.  Building the full server is out of budget
+# for a CI runner (1.5-3 h), so this harness replicates the exact Win32 op
+# shapes of os_parent_dir_fsync_win()'s six call sites (mkdir / create /
+# delete / rename) and times the three flush variants on them:
+#   none - upstream Windows behavior (no flush at all)
+#   dir  - PR #895 commit 1 (parent-directory flush)
+#   root - PR #895 head 9eb979ae (+ volume-root flush)
+# This is a SIMULATION of the call sites, not a server benchmark; the
+# per-flush device cost is the same Win32 call the patched server makes.
+
+on:
+  push:
+    branches: [bench-e26]
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: rig
+        uses: actions/checkout@v4
+        with:
+          path: rig
+
+      - name: sim - mkdir/create/delete/rename shapes, 3 rounds x 3 variants
+        shell: pwsh
+        run: |
+          rig\e26_mysql_sim.ps1 -Volume D: -Iters 200 -Warmup 20
